@@ -38,6 +38,8 @@ class EvalConfig:
     shifted_delay_type: str
     initial_max_delay: int
     shifted_max_delay: int
+    initial_delay_process: str = "legacy"
+    shifted_delay_process: str = "legacy"
     delay_type_max_delay: Optional[Dict[str, int]] = None
 
 
@@ -119,6 +121,7 @@ def load_parameter_from_run(run_dir: Path) -> Parameter:
 def override_delay_eval_setup(param: Parameter, eval_cfg: EvalConfig) -> None:
     param.use_delay = True
     param.nonstationary_delay = False
+    param.delay_process = eval_cfg.initial_delay_process
     param.initial_delay_type = eval_cfg.initial_delay_type
     # max_delay_range 必须覆盖到所有可能出现的 max_delay（无论是从
     # delay_type_max_delay 映射中解析出的，还是从显式的 initial/shifted
@@ -166,10 +169,29 @@ def set_delay_mode(env: Any, delay_type: str, max_delay: int) -> Dict[str, Any]:
     return task
 
 
+def set_evaluation_delay_mode(
+    env: Any,
+    delay_process: str,
+    delay_type: str,
+    max_delay: int,
+) -> Dict[str, Any]:
+    """Apply one evaluation phase's process or legacy delay task."""
+    current_process = getattr(env, "delay_process", "legacy")
+    if current_process != delay_process and hasattr(env, "set_delay_process"):
+        env.set_delay_process(delay_process)
+    if delay_process != "legacy":
+        return {"delay_process": delay_process}
+    return set_delay_mode(env, delay_type, max_delay)
+
+
 def get_delay_state(env: Any) -> Dict[str, Any]:
     return {
+        "delay_process": getattr(env, "delay_process", "legacy"),
         "delay_type": getattr(env, "current_delay_type", None),
         "max_delay": int(getattr(env, "current_max_delay", -1)),
+        "sampled_observation_delay": int(getattr(env, "last_sampled_delay", 0)),
+        "delay_regime": getattr(env, "current_delay_regime", "legacy"),
+        "delay_censored": bool(getattr(env, "delay_censored", False)),
         "delay_vector": _to_builtin(getattr(env, "delay_distribution_vector", [])),
         "env_parameter_vector": _to_builtin(getattr(env, "env_parameter_vector", [])),
     }
@@ -201,8 +223,16 @@ def evaluate_episode(
     env = worker.env
     initial_max_delay = resolve_max_delay(eval_cfg.initial_delay_type, eval_cfg, "initial")
     shifted_max_delay = resolve_max_delay(eval_cfg.shifted_delay_type, eval_cfg, "shifted")
-    initial_task = set_delay_mode(env, eval_cfg.initial_delay_type, initial_max_delay)
-    shifted_task = {"delay_type": eval_cfg.shifted_delay_type, "max_delay": int(shifted_max_delay)}
+    initial_task = set_evaluation_delay_mode(
+        env, eval_cfg.initial_delay_process, eval_cfg.initial_delay_type, initial_max_delay
+    )
+    shifted_task = set_evaluation_delay_mode(
+        env, eval_cfg.shifted_delay_process, eval_cfg.shifted_delay_type, shifted_max_delay
+    ) if eval_cfg.shift_step == 0 else (
+        {"delay_process": eval_cfg.shifted_delay_process}
+        if eval_cfg.shifted_delay_process != "legacy"
+        else {"delay_type": eval_cfg.shifted_delay_type, "max_delay": int(shifted_max_delay)}
+    )
 
     total_reward = 0.0
     step_rows: List[Dict[str, Any]] = []
@@ -213,7 +243,9 @@ def evaluate_episode(
 
     for step in range(horizon):
         if (not shift_applied) and step == eval_cfg.shift_step:
-            set_delay_mode(env, shifted_task["delay_type"], shifted_task["max_delay"])
+            set_evaluation_delay_mode(
+                env, eval_cfg.shifted_delay_process, eval_cfg.shifted_delay_type, shifted_max_delay
+            )
             shift_applied = True
 
         state_tensor = torch.from_numpy(worker.state).to(torch.get_default_dtype()).unsqueeze(0)
@@ -238,6 +270,8 @@ def evaluate_episode(
             break
 
     post_shift_rewards = [r["reward"] for r in step_rows if r["shift_applied"] == 1]
+    sampled_delays = [int(r["sampled_observation_delay"]) for r in step_rows]
+    censored_count = sum(1 for r in step_rows if r["delay_censored"])
     
     # Compute baseline from stable pre-shift window (skip first 20 steps)
     baseline_start = max(20, eval_cfg.shift_step - 50)
@@ -273,6 +307,12 @@ def evaluate_episode(
         "episode": episode_index,
         "initial_task": initial_task,
         "shifted_task": shifted_task,
+        "initial_delay_process": eval_cfg.initial_delay_process,
+        "shifted_delay_process": eval_cfg.shifted_delay_process,
+        "shift_step": eval_cfg.shift_step,
+        "sampled_delay_min": min(sampled_delays) if sampled_delays else None,
+        "sampled_delay_max": max(sampled_delays) if sampled_delays else None,
+        "censored_count": censored_count,
         "total_reward": total_reward,
         "steps": len(step_rows),
         "pre_shift_steps": eval_cfg.shift_step,
@@ -314,6 +354,16 @@ def summarize_results(results: Sequence[Dict[str, Any]], recovery_window: int = 
         "short_episode_count": len(short_episodes),
         "not_recovered_count": len(not_recovered),
         "avg_post_shift_steps": float(np.mean(post_shift_step_counts)) if post_shift_step_counts else None,
+        "initial_delay_process": results[0].get("initial_delay_process", "legacy") if results else "legacy",
+        "shifted_delay_process": results[0].get("shifted_delay_process", "legacy") if results else "legacy",
+        "shift_step": results[0].get("shift_step") if results else None,
+        "sampled_delay_min": min(
+            r["sampled_delay_min"] for r in results if r.get("sampled_delay_min") is not None
+        ) if any(r.get("sampled_delay_min") is not None for r in results) else None,
+        "sampled_delay_max": max(
+            r["sampled_delay_max"] for r in results if r.get("sampled_delay_max") is not None
+        ) if any(r.get("sampled_delay_max") is not None for r in results) else None,
+        "censored_count": int(sum(r.get("censored_count", 0) for r in results)),
     }
     
     # Add per-episode breakdown
@@ -472,6 +522,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--initial-delay-type", type=str, default="gamma", choices=["gamma", "uniform", "doublegaussian"])
     parser.add_argument("--shifted-delay-type", type=str, default="uniform", choices=["gamma", "uniform", "doublegaussian"])
+    parser.add_argument(
+        "--initial-delay-process",
+        type=str,
+        default="legacy",
+        choices=["legacy", "ge1_23", "ge4_32", "mm1"],
+    )
+    parser.add_argument(
+        "--shifted-delay-process",
+        type=str,
+        default="legacy",
+        choices=["legacy", "ge1_23", "ge4_32", "mm1"],
+    )
     parser.add_argument("--initial-max-delay", type=int, default=6)
     parser.add_argument("--shifted-max-delay", type=int, default=9)
     parser.add_argument(
@@ -521,6 +583,8 @@ def main() -> None:
         shifted_delay_type=args.shifted_delay_type,
         initial_max_delay=args.initial_max_delay,
         shifted_max_delay=args.shifted_max_delay,
+        initial_delay_process=args.initial_delay_process,
+        shifted_delay_process=args.shifted_delay_process,
         delay_type_max_delay=type_max_delay_map,
     )
 
@@ -531,7 +595,9 @@ def main() -> None:
     shifted_max_delay = resolve_max_delay(eval_cfg.shifted_delay_type, eval_cfg, "shifted")
     print(
         f"[delay-shift-eval] strategy: "
+        f"{eval_cfg.initial_delay_process}/"
         f"{eval_cfg.initial_delay_type}(max_delay={initial_max_delay}) -> "
+        f"{eval_cfg.shifted_delay_process}/"
         f"{eval_cfg.shifted_delay_type}(max_delay={shifted_max_delay}) "
         f"at env step {eval_cfg.shift_step}; "
         f"type->max_delay binding: {eval_cfg.delay_type_max_delay}"

@@ -5,6 +5,7 @@ import copy
 from gymnasium.utils import seeding
 
 from envs.delayed_distribution import DoubleGaussianDistribution, GammaDistribution, UniformDistribution
+from envs.acda_delay_process import create_acda_observation_delay_process
 
 
 class NonstationaryDelayedEnv(gym.Wrapper):
@@ -15,6 +16,7 @@ class NonstationaryDelayedEnv(gym.Wrapper):
 
     # 支持的延迟分布类型
     DELAY_DISTRIBUTIONS = ['gamma', 'uniform', 'doublegaussian']
+    ACDA_DELAY_PROCESSES = ('legacy', 'ge1_23', 'ge4_32', 'mm1')
 
     def __init__(self, env,
                  initial_delay_type="gamma",
@@ -24,7 +26,8 @@ class NonstationaryDelayedEnv(gym.Wrapper):
                  max_delay_range=(3, 10),  # 最大延迟的范围
                  initial_action=None,
                  skip_initial_actions=False,
-                 random_delay_per_episode=True):  # 每个episode是否随机延迟
+                 random_delay_per_episode=True,
+                 delay_process="legacy"):  # 每个episode是否随机延迟
         """
         初始化非平稳延迟环境
 
@@ -37,6 +40,7 @@ class NonstationaryDelayedEnv(gym.Wrapper):
             max_delay_range: 最大延迟的范围 (min_delay, max_delay)
             initial_action: 初始动作
             skip_initial_actions: 是否跳过初始动作
+            delay_process: legacy 或 ACDA-derived observation delay process
         """
         super().__init__(env)
 
@@ -52,11 +56,27 @@ class NonstationaryDelayedEnv(gym.Wrapper):
 
         # 每个episode是否随机延迟
         self.random_delay_per_episode = random_delay_per_episode
+        if delay_process not in self.ACDA_DELAY_PROCESSES:
+            raise ValueError(
+                f"不支持的延迟过程: {delay_process}; "
+                f"可选值: {', '.join(self.ACDA_DELAY_PROCESSES)}"
+            )
+        self.delay_process = delay_process
+        self._delay_rng = np.random.default_rng()
+        self._delay_process = None
 
         # 初始化延迟分布
         self.current_delay_type = initial_delay_type
+        self._legacy_delay_type = initial_delay_type
         self.current_max_delay = np.random.randint(max_delay_range[0], max_delay_range[1] + 1)
         self.obs_delay_dis = self._create_delay_distribution(initial_delay_type, self.current_max_delay)
+        if self.delay_process != "legacy":
+            self._delay_process = create_acda_observation_delay_process(self.delay_process, self._delay_rng)
+            self.current_max_delay = self._delay_process.max_delay
+            self.obs_delay_dis = None
+            self._minimum_buffer_length = self._delay_process.max_delay + 1
+        else:
+            self._minimum_buffer_length = max_delay_range[1] + 1
 
         # 延迟任务列表（用于非平稳变化）
         self.delay_tasks = None
@@ -66,8 +86,12 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         self._explicit_delay_task_active = False
 
         # 初始化缓冲区
-        self.past_observations = deque(maxlen=max_delay_range[1] + 1)
-        self.arrival_times_observations = deque(maxlen=max_delay_range[1] + 1)
+        self.past_observations = deque(maxlen=self._minimum_buffer_length)
+        self.arrival_times_observations = deque(maxlen=self._minimum_buffer_length)
+        self.last_sampled_delay = 0
+        self.last_delay_probability_vector = np.zeros(33, dtype=np.float32)
+        self.current_delay_regime = "legacy"
+        self.delay_censored = False
 
         # 时间和奖励追踪
         self.t = 0
@@ -208,6 +232,9 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         返回:
             延迟任务列表，每个任务包含 (delay_type, max_delay)
         """
+        if self.delay_process != "legacy":
+            return [{"delay_process": self.delay_process} for _ in range(n_tasks)]
+
         tasks = []
         for _ in range(n_tasks):
             # 随机选择延迟类型
@@ -260,7 +287,7 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         参数:
             max_delay: 新的最大延迟步数
         """
-        new_maxlen = max(self.max_delay_range[1] + 1, max_delay + 1)
+        new_maxlen = max(self._minimum_buffer_length, max_delay + 1)
         if self.past_observations.maxlen != new_maxlen:
             old_obs = list(self.past_observations)
             old_times = list(self.arrival_times_observations)
@@ -274,17 +301,57 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         参数:
             task: 延迟任务字典，包含 'delay_type' 和 'max_delay'
         """
+        if "delay_process" in task:
+            self.set_delay_process(task["delay_process"])
+            return
+
+        if self.delay_process != "legacy":
+            raise ValueError("ACDA-derived delay environments require a delay_process task")
+
         delay_type = task['delay_type']
         max_delay = task['max_delay']
 
         # 更新当前延迟分布
         self.current_delay_type = delay_type
+        self._legacy_delay_type = delay_type
         self.current_max_delay = max_delay
         self.obs_delay_dis = self._create_delay_distribution(delay_type, max_delay)
         self._explicit_delay_task_active = True
 
         # 更新缓冲区大小
         self._update_buffer_maxlen(max_delay)
+
+    def set_delay_process(self, name):
+        """Switch the observation-delay process without clearing in-flight data."""
+        if name not in self.ACDA_DELAY_PROCESSES:
+            raise ValueError(
+                f"不支持的延迟过程: {name}; 可选值: {', '.join(self.ACDA_DELAY_PROCESSES)}"
+            )
+
+        self.delay_process = name
+        if name == "legacy":
+            self._delay_process = None
+            self._minimum_buffer_length = max(self.max_delay_range[1] + 1, self.past_observations.maxlen)
+            if self.current_delay_type not in self.DELAY_DISTRIBUTIONS:
+                self.current_delay_type = self._legacy_delay_type
+            if self.obs_delay_dis is None:
+                self.current_max_delay = min(self.current_max_delay, self.max_delay_range[1])
+                self.obs_delay_dis = self._create_delay_distribution(
+                    self.current_delay_type, self.current_max_delay
+                )
+            self.current_delay_regime = "legacy"
+            self.delay_censored = False
+            self._update_buffer_maxlen(self.current_max_delay)
+            return
+
+        self._delay_process = create_acda_observation_delay_process(name, self._delay_rng)
+        self.current_max_delay = self._delay_process.max_delay
+        self.current_delay_type = name
+        self.obs_delay_dis = None
+        self.current_delay_regime = self._delay_process.regime
+        self.delay_censored = False
+        self._minimum_buffer_length = max(self._minimum_buffer_length, self._delay_process.max_delay + 1)
+        self._update_buffer_maxlen(self._delay_process.max_delay)
 
     def set_nonstationary_para(self, setting_env_params, changine_period, changing_interval):
         """
@@ -344,8 +411,26 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         self.done_signal_sent = False
         self.cur_step_ind = 0
 
+        if self.delay_process != "legacy":
+            if kwargs.get("seed") is not None:
+                self._delay_rng = np.random.default_rng(kwargs["seed"])
+                self._delay_process = create_acda_observation_delay_process(
+                    self.delay_process, self._delay_rng
+                )
+            else:
+                self._delay_process.reset()
+            self.current_max_delay = self._delay_process.max_delay
+            self.current_delay_type = self.delay_process
+            self.obs_delay_dis = None
+            self.current_delay_regime = self._delay_process.regime
+            self.delay_censored = False
+            self.last_sampled_delay = 0
+            self.last_delay_probability_vector = self._delay_process.probability_vector(33).astype(
+                np.float32, copy=True
+            )
+
         # 每个episode开始时随机选择延迟参数（如果启用）
-        if self.random_delay_per_episode and not self._explicit_delay_task_active:
+        if self.delay_process == "legacy" and self.random_delay_per_episode and not self._explicit_delay_task_active:
             # 随机选择延迟类型
             self.current_delay_type = np.random.choice(self.DELAY_DISTRIBUTIONS)
             # 随机选择最大延迟（在范围内）
@@ -372,7 +457,8 @@ class NonstationaryDelayedEnv(gym.Wrapper):
             info = {}
 
         # 填充缓冲区
-        self.t = - (self.obs_delay_dis.max_delay + 1)  # 这个值 <= -1
+        delay_horizon = self._delay_process.max_delay if self._delay_process is not None else self.obs_delay_dis.max_delay
+        self.t = -(delay_horizon + 1)  # 这个值 <= -1
         while self.t <= 0:  # 注意：包含 t=0，以确保有观察可用
             self.send_observation((first_observation, 0., False, False, {}, 0))
             self.t += 1
@@ -380,10 +466,23 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         # 现在 self.t == 1，但我们要获取 t=0 时的观察
         self.t = 0
         received_observation, *_ = self.receive_observation()
+        info.update(self._delay_info())
         return received_observation, info
 
     def seed(self, seed=None):
         """设置随机种子"""
+        if self.delay_process != "legacy" and seed is not None:
+            self._delay_rng = np.random.default_rng(seed)
+            self._delay_process = create_acda_observation_delay_process(self.delay_process, self._delay_rng)
+            self.current_max_delay = self._delay_process.max_delay
+            self.current_delay_type = self.delay_process
+            self.obs_delay_dis = None
+            self.current_delay_regime = self._delay_process.regime
+            self.last_sampled_delay = 0
+            self.last_delay_probability_vector = self._delay_process.probability_vector(33).astype(
+                np.float32, copy=True
+            )
+
         # 直接调用unwrapped环境的seed方法
         if hasattr(self.unwrapped, 'seed'):
             return self.unwrapped.seed(seed)
@@ -401,7 +500,7 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         # 延迟参数变化：每 delay_changing_interval 步检查一次，
         # 按 delay_changing_period 节奏改变 max_delay
         # =========================================================
-        if (self.delay_tasks is not None and
+        if (self.delay_process == "legacy" and self.delay_tasks is not None and
                 self.delay_changing_interval > 0 and
                 self.cur_step_ind % self.delay_changing_interval == 0):
             param_ind = (self.cur_step_ind // self.delay_changing_period) % len(self.delay_tasks)
@@ -466,6 +565,7 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         # 在info中添加延迟信息
         info['current_delay_type'] = self.current_delay_type
         info['current_max_delay'] = self.current_max_delay
+        info.update(self._delay_info())
 
         return m, r, terminated, truncated, info
 
@@ -476,9 +576,30 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         参数:
             obs: 观察元组 (observation, reward, terminated, truncated, info, _)
         """
-        alpha = self.obs_delay_dis.dis_sample()  # 采样延迟步数
+        if self._delay_process is not None:
+            alpha = self._delay_process.sample()
+            self.last_sampled_delay = int(alpha)
+            self.last_delay_probability_vector = self._delay_process.probability_vector(33).astype(
+                np.float32, copy=True
+            )
+            self.current_delay_regime = self._delay_process.regime
+            self.delay_censored = bool(self._delay_process.last_was_censored)
+        else:
+            alpha = self.obs_delay_dis.dis_sample()  # 采样延迟步数
+            self.last_sampled_delay = int(alpha)
+            self.last_delay_probability_vector = self.delay_distribution_vector.copy()
+            self.current_delay_regime = "legacy"
+            self.delay_censored = False
         self.arrival_times_observations.appendleft(self.t + alpha)
         self.past_observations.appendleft(obs)
+
+    def _delay_info(self):
+        return {
+            "delay_process": self.delay_process,
+            "sampled_observation_delay": int(self.last_sampled_delay),
+            "delay_regime": self.current_delay_regime,
+            "delay_censored": bool(self.delay_censored),
+        }
 
     def receive_observation(self):
         """
@@ -529,10 +650,8 @@ class NonstationaryDelayedEnv(gym.Wrapper):
         """
         # 递归查找有 env_parameter_length 属性的环境
         env_with_attr = self._find_env_with_attr('env_parameter_length')
-        if env_with_attr is not None:
-            return env_with_attr.env_parameter_length
-        else:
-            return 0
+        physics_length = env_with_attr.env_parameter_length if env_with_attr is not None else 0
+        return physics_length + self.delay_distribution_dim
 
     @property
     def env_parameter_vector(self):
@@ -559,23 +678,25 @@ class NonstationaryDelayedEnv(gym.Wrapper):
     def delay_distribution_vector(self):
         """
         获取延迟分布的概率向量，用于 WMCL Loss 计算
-        返回: [K] 概率向量，固定为11维（0-10延迟步数的概率）
+        返回: [K] 概率向量，固定为33维（0-32延迟步数的概率）
         """
+        if self._delay_process is not None:
+            return self.last_delay_probability_vector.astype(np.float32, copy=True)
         if hasattr(self, 'obs_delay_dis') and self.obs_delay_dis is not None:
             if hasattr(self.obs_delay_dis, 'dis_probability'):
                 probs = self.obs_delay_dis.dis_probability()
-                # 确保返回11维向量
-                result = np.zeros(11, dtype=np.float32)
+                # 确保返回33维向量
+                result = np.zeros(33, dtype=np.float32)
                 result[:len(probs)] = probs
                 return result
-        return np.zeros(11, dtype=np.float32)  # 默认返回零向量
+        return np.zeros(33, dtype=np.float32)  # 默认返回零向量
 
     @property
     def delay_distribution_dim(self):
         """
         获取延迟分布的维度
         """
-        return 11  # 固定为11维
+        return 33  # 固定为33维
 
     @property
     def _elapsed_steps(self):

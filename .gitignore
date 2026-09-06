@@ -8,5 +8,9 @@ log_file
 baselines.tar.gz
 .venv
 plot_crash_analysis.py
+.codex
+.trellis
+.agents
 
-
+docs
+tests

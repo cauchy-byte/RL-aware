@@ -24,6 +24,35 @@ from envs.grid_world import RandomGridWorld
 from envs.grid_world_general import RandomGridWorldPlat
 from algorithms.contrastive import ContrastiveLoss
 
+
+def parallel_collection_steps(target_transitions, worker_num):
+    if worker_num <= 0:
+        raise ValueError('worker_num must be positive')
+    if target_transitions <= 0:
+        return 0
+    return (target_transitions + worker_num - 1) // worker_num
+
+
+def count_crossed_update_boundaries(previous_transitions, current_transitions, interval):
+    if interval <= 0:
+        raise ValueError('interval must be positive')
+    return (current_transitions // interval) - (previous_transitions // interval)
+
+
+def has_exact_task_ids(task, required_task_ids=(1, 2, 3)):
+    if torch.is_tensor(task):
+        task = task.detach().cpu().numpy()
+    task = np.asarray(task)
+    if task.size == 0:
+        return False
+    if task.ndim >= 3:
+        task = task[..., -1, 0]
+    elif task.ndim >= 2:
+        task = task[..., 0]
+    sampled_task_ids = set(np.asarray(task).reshape(-1).astype(int).tolist())
+    return sampled_task_ids == set(required_task_ids)
+
+
 class SAC:
     def __init__(self):
         self.logger = Logger()
@@ -48,8 +77,8 @@ class SAC:
         self.test_tasks = self.env.sample_tasks(self.parameter.test_task_num)
         self.ood_tasks = self.ood_env.sample_tasks(self.parameter.test_task_num)
         self.training_agent = EnvRemoteArray(parameter=self.parameter, env_name=self.parameter.env_name,
-                                             worker_num=1, seed=self.parameter.seed,
-                                             deterministic=False, use_remote=False, policy_type=Policy,
+                                             worker_num=self.parameter.training_worker_num, seed=self.parameter.seed,
+                                             deterministic=False, use_remote=True, policy_type=Policy,
                                              history_len=self.parameter.history_length, env_decoration=env_decoration,
                                              env_tasks=self.env_tasks,
                                              use_true_parameter=self.parameter.use_true_parameter,
@@ -142,7 +171,7 @@ class SAC:
         self.rmdm_loss = RMDMLoss(max_env_len=max(self.parameter.task_num,
                                                   getattr(self.parameter, 'delay_task_num', 0)),
                                   tau=self.parameter.rmdm_tau)
-        self.wmcl_loss = WassersteinMetricLoss(max_dist_dim=11) if getattr(self.parameter, 'use_wmcl', False) else None
+        self.wmcl_loss = WassersteinMetricLoss(max_dist_dim=33) if getattr(self.parameter, 'use_wmcl', False) else None
         to_device(self.device, self.policy, self.policy_for_test, self.value1, self.value2, self.target_value1, self.target_value2)
 
         self.transition = None
@@ -222,7 +251,7 @@ class SAC:
             query_tensor = None
         # if not FC_MODE:
         rmdm_loss_tensor = consistency_loss = diverse_loss = None
-        batch_task_num = 1
+        batch_task_num = 0
         """update critic/value net"""
         self.timer.register_point('calculating_target_Q', level=3)     # (TIME: 0.011)
         consis_w = torch.exp(self.log_consis_w_alpha)
@@ -444,8 +473,10 @@ class SAC:
             self.all_valids = [item.detach() for item in all_valids]
             self.all_tasks = self.rmdm_loss.lst_tasks
             do_not_train_ep = False
+            required_repre_task_num = (3 if getattr(self.parameter, 'delay_task_strategy', 'random') == 'acda_cycle'
+                                       else int(0.5 * self.parameter.task_num))
             if self.replay_buffer.size < self.parameter.minimal_repre_rp_size\
-                    or len(self.all_tasks) < int(0.5 * self.parameter.task_num):
+                    or len(self.all_tasks) < required_repre_task_num:
                 do_not_train_ep = True
             if rmdm_loss_tensor is not None and not do_not_train_ep:
                 if torch.isnan(consistency_loss).any().item() or torch.isnan(diverse_loss).any().item():
@@ -639,15 +670,37 @@ class SAC:
         log = {}
         for _ in range(self.parameter.update_interval):
             self.timer.register_point('sample_from_replay', level=1)     # (TIME: 0.4)
-            if FC_MODE:
-                batch = self.replay_buffer.sample_transitions(self.parameter.sac_mini_batch_size)
-            else:
-                if self.parameter.rnn_fix_length:
-                    batch = self.replay_buffer.sample_fix_length_sub_trajs(self.parameter.sac_mini_batch_size,
-                                                                           self.parameter.rnn_fix_length)
+            acda_cycle = getattr(self.parameter, 'delay_task_strategy', 'random') == 'acda_cycle'
+            representation_batch_ready = not acda_cycle
+            batch = None
+            if acda_cycle:
+                if FC_MODE:
+                    batch = self.replay_buffer.sample_transitions_task_balanced(
+                        self.parameter.sac_mini_batch_size, task_ids=(1, 2, 3)
+                    )
+                elif self.parameter.rnn_fix_length:
+                    batch = self.replay_buffer.sample_fix_length_sub_trajs_task_balanced(
+                        self.parameter.sac_mini_batch_size,
+                        self.parameter.rnn_fix_length,
+                        task_ids=(1, 2, 3),
+                    )
+                representation_batch_ready = (
+                    batch is not None and has_exact_task_ids(batch.task)
+                )
+
+            if batch is None:
+                if FC_MODE:
+                    batch = self.replay_buffer.sample_transitions(self.parameter.sac_mini_batch_size)
+                elif self.parameter.rnn_fix_length:
+                    batch = self.replay_buffer.sample_fix_length_sub_trajs(
+                        self.parameter.sac_mini_batch_size,
+                        self.parameter.rnn_fix_length,
+                    )
                 else:
-                    batch, total_size = self.replay_buffer.sample_trajs(self.parameter.sac_mini_batch_size,
-                                                        self.parameter.rnn_sample_max_batch_size)
+                    batch, total_size = self.replay_buffer.sample_trajs(
+                        self.parameter.sac_mini_batch_size,
+                        self.parameter.rnn_sample_max_batch_size,
+                    )
                 # self.logger.log(f'total transition in the trajectories is {total_size}, state shape: {np.array(batch.state).shape}')
 
             dtype = torch.get_default_dtype()
@@ -743,9 +796,13 @@ class SAC:
             with torch.set_grad_enabled(True):
                 if FC_MODE:
                     self.timer.register_point('self.sac_update', level=1)
+                    can_optimize_ep = (self.replay_buffer.size > self.parameter.ep_start_num
+                                       and representation_batch_ready
+                                       and (not acda_cycle or has_exact_task_ids(task)))
                     res_dict = self.sac_update(states, actions, next_states,
                                                rewards, masks, last_action, valid, task, env_param, hidden_policy,
-                                               hidden_value1, hidden_value2)
+                                               hidden_value1, hidden_value2,
+                                               can_optimize_ep=can_optimize_ep)
                     self.timer.register_end(level=1)
                 else:
                     point_num = states.shape[0]
@@ -777,7 +834,9 @@ class SAC:
                                 [end] * 3)
                         hidden_transition_batch = None
                         self.timer.register_point('self.sac_update', level=1)     # (TIME: 0.091)
-                        can_optimize_ep = self.replay_buffer.size > self.parameter.ep_start_num
+                        can_optimize_ep = (self.replay_buffer.size > self.parameter.ep_start_num
+                                           and representation_batch_ready
+                                           and (not acda_cycle or has_exact_task_ids(task_batch)))
                         res_dict = self.sac_update(states_batch, actions_batch, next_states_batch, rewards_batch,
                                                    masks_batch, last_action_batch, valid_batch, task_batch, env_param_batch,
                                                    hidden_policy_batch, hidden_value1_batch, hidden_value2_batch,
@@ -822,9 +881,13 @@ class SAC:
                 mem, log = self.training_agent.sample1step(self.policy,
                                                            self.replay_buffer.size < self.parameter.random_num,
                                                            device=torch.device('cpu'))
-                self.replay_buffer.mem_push(mem)
-                total_steps += 1
+                transition_count = len(mem)
+                self.replay_buffer.mem_push(
+                    mem, parallel_worker_num=self.training_agent.worker_num
+                )
+                total_steps += transition_count
             self.logger("init done!!!")
+        update_transition_clock = 0
         for iter in range(self.parameter.max_iter_num):
             self.logger(f"Starting iteration {iter}")
             self.policy.to(torch.device('cpu'))
@@ -839,9 +902,11 @@ class SAC:
             self.logger("All tasks submitted")
             self.logger.log(f"Current time: {datetime.now().strftime('%H:%M:%S')}")
             training_start = time.time()
-            single_step_iterater = range(self.parameter.min_batch_size) if not USE_TQDM else\
-                tqdm(range(self.parameter.min_batch_size))
-            for step in single_step_iterater:
+            target_transitions = self.parameter.min_batch_size
+            collected_transitions = 0
+            update_stride = self.parameter.update_interval * self.parameter.sac_inner_iter_num
+            progress_bar = tqdm(total=target_transitions) if USE_TQDM else None
+            while collected_transitions < target_transitions:
                 # self.policy.to(torch.device('cpu'))
                 self.policy.to(self.device)
                 self.timer.register_point('sample1step')
@@ -850,18 +915,33 @@ class SAC:
                                                            device=self.device)
                 self.timer.register_end()
 
-                if step % (self.parameter.update_interval * self.parameter.sac_inner_iter_num) == 0 \
-                        and self.replay_buffer.size > self.parameter.start_train_num and len(self.replay_buffer) > 1:
-                    self.policy.to(self.device)
-                    self.timer.register_point('self.update')
-                    update_log = self.update()
-                    self.timer.register_end()
-                    log.update(update_log)
-                    pass
                 self.timer.register_point('self.replay_buffer.mem_push')
-                self.replay_buffer.mem_push(mem)
+                transition_count = len(mem)
+                self.replay_buffer.mem_push(
+                    mem, parallel_worker_num=self.training_agent.worker_num
+                )
                 self.timer.register_end()
+                previous_update_clock = update_transition_clock
+                update_transition_clock += transition_count
+                collected_transitions += transition_count
+                total_steps += transition_count
+                if progress_bar is not None:
+                    progress_bar.update(transition_count)
+
+                update_num = count_crossed_update_boundaries(
+                    previous_update_clock, update_transition_clock, update_stride
+                )
+                for _ in range(update_num):
+                    if (self.replay_buffer.size > self.parameter.start_train_num
+                            and len(self.replay_buffer) > 1):
+                        self.policy.to(self.device)
+                        self.timer.register_point('self.update')
+                        update_log = self.update()
+                        self.timer.register_end()
+                        log.update(update_log)
                 self.logger.add_tabular_data(**log, tb_prefix='training')
+            if progress_bar is not None:
+                progress_bar.close()
             representation_behaviour, diff_from_expert = self.test_non_stationary_repre()
             if iter % 10 == 0:
                 if self.all_repre is not None and self.env_param_dict is not None and len(self.env_param_dict) > 0:
@@ -875,7 +955,6 @@ class SAC:
                         self.logger.tb.add_figure('figs/repre_mean', fig_mean, iter)
                         self.logger.tb.add_figure('figs/repre_real', fig_real_param, iter)
                 self.logger.tb.add_figure('figs/policy_behaviour', representation_behaviour, iter)
-            total_steps += self.parameter.min_batch_size
             training_end = time.time()
             self.logger.log('start testing...')
             batch_test, log_test, mem_test = self.test_agent.query_sample(future_test, need_memory=True)
@@ -889,6 +968,7 @@ class SAC:
             self.logger.add_tabular_data(tb_prefix='evaluation', **self.append_key(log_non_station, "NS"))
             self.logger.add_tabular_data(tb_prefix='evaluation', **self.append_key(log_ood_ns, 'OOD_NS'))
             self.logger.log_tabular('TotalInteraction', total_steps, tb_prefix='timestep')
+            self.logger.log_tabular('IterationTransitions', collected_transitions, tb_prefix='timestep')
             #self.logger.log_tabular('OODDeltaVSTestRet', np.mean(log_ood['EpRet']) - np.mean(log_test['EpRet']), tb_prefix='evaluation')
             self.logger.log_tabular('NSDeltaVSTestRet', np.mean(log_non_station['EpRet']) - np.mean(log_test['EpRet']), tb_prefix='evaluation')
             self.logger.log_tabular('ReplayBufferTrajNum', len(self.replay_buffer), tb_prefix='timestep')

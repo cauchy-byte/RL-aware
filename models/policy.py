@@ -41,6 +41,7 @@ class Policy(torch.nn.Module):
         self.min_log_std = -7.0
         self.max_log_std = 2.0
         self.sample_hidden_state = None
+        self.sample_hidden_states = None
         self.rnn_fix_length = rnn_fix_length
         self.use_rmdm = use_rmdm
         self.ep_tensor = None
@@ -55,10 +56,18 @@ class Policy(torch.nn.Module):
     def to(self, device):
         if not device == self.device:
             self.device = device
-            if self.sample_hidden_state is not None:
-                for i in range(len(self.sample_hidden_state)):
-                    if self.sample_hidden_state[i] is not None:
-                        self.sample_hidden_state[i] = self.sample_hidden_state[i].to(self.device)
+            hidden_groups = self.sample_hidden_states
+            if hidden_groups is None and self.sample_hidden_state is not None:
+                hidden_groups = [self.sample_hidden_state]
+            if hidden_groups is not None:
+                for hidden_state in hidden_groups:
+                    for i in range(len(hidden_state)):
+                        if hidden_state[i] is None:
+                            continue
+                        if isinstance(hidden_state[i], tuple):
+                            hidden_state[i] = tuple(item.to(self.device) for item in hidden_state[i])
+                        else:
+                            hidden_state[i] = hidden_state[i].to(self.device)
             super().to(device)
 
     def get_ep_temp(self, x, h, require_full_output=False):
@@ -230,9 +239,14 @@ class Policy(torch.nn.Module):
 
     def inference_init_hidden(self, batch_size, device=torch.device("cpu")):
         if self.rnn_fix_length is None or self.rnn_fix_length == 0:
+            self.sample_hidden_states = None
             self.sample_hidden_state = self.make_init_state(batch_size, device)
         else:
-            self.sample_hidden_state = [None] * len(self.make_init_state(batch_size, device))
+            hidden_num = len(self.make_init_state(1, device))
+            self.sample_hidden_states = [
+                [None] * hidden_num for _ in range(batch_size)
+            ]
+            self.sample_hidden_state = self.sample_hidden_states[0] if batch_size > 0 else []
 
     def inference_check_hidden(self, batch_size):
         if self.sample_hidden_state is None:
@@ -240,7 +254,8 @@ class Policy(torch.nn.Module):
         if len(self.sample_hidden_state) == 0:
             return True
         if self.rnn_fix_length is not None and self.rnn_fix_length > 0:
-            return True
+            return (self.sample_hidden_states is not None
+                    and len(self.sample_hidden_states) == batch_size)
         if isinstance(self.sample_hidden_state[0], tuple):
             return self.sample_hidden_state[0][0].shape[0] == batch_size
         else:
@@ -273,6 +288,23 @@ class Policy(torch.nn.Module):
 
     def inference_one_step(self, state, deterministic=True):
         self.set_deterministic_ep(deterministic)
+        if self.rnn_fix_length is not None and self.rnn_fix_length > 0:
+            batch_size = state.shape[0]
+            if not self.inference_check_hidden(batch_size):
+                self.inference_init_hidden(batch_size, state.device)
+            outputs = []
+            for worker_index in range(batch_size):
+                self.sample_hidden_state = self.sample_hidden_states[worker_index]
+                outputs.append(self._inference_one_step_single(
+                    state[worker_index:worker_index + 1], deterministic
+                ))
+                self.sample_hidden_states[worker_index] = self.sample_hidden_state
+            if self.sample_hidden_states:
+                self.sample_hidden_state = self.sample_hidden_states[0]
+            return torch.cat(outputs, dim=0)
+        return self._inference_one_step_single(state, deterministic)
+
+    def _inference_one_step_single(self, state, deterministic=True):
         with torch.no_grad():
             # 调试：打印原始输入状态的形状
             #print(f"[DEBUG inference_one_step] Input state shape: {state.shape}, total_dim: {state.shape[-1]}")
@@ -301,7 +333,11 @@ class Policy(torch.nn.Module):
 
     def inference_reset_one_hidden(self, idx):
         if self.rnn_fix_length is not None and self.rnn_fix_length > 0:
-            raise NotImplementedError('if rnn fix length is set, parallel sampling is not allowed!!!')
+            hidden_num = len(self.make_init_state(1, self.device))
+            self.sample_hidden_states[idx] = [None] * hidden_num
+            if idx == 0:
+                self.sample_hidden_state = self.sample_hidden_states[0]
+            return
         for i in range(len(self.sample_hidden_state)):
             if isinstance(self.sample_hidden_state[i], tuple):
                 self.sample_hidden_state[i][0][0, idx] = 0

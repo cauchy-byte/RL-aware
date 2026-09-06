@@ -10,6 +10,13 @@ from envs.nonstationary_env import NonstationaryEnv
 from envs.nonstationary_delayed_env import NonstationaryDelayedEnv
 
 
+ACDA_TASKS = (
+    {"task_id": 1, "delay_process": "ge1_23"},
+    {"task_id": 2, "delay_process": "ge4_32"},
+    {"task_id": 3, "delay_process": "mm1"},
+)
+
+
 def create_env_decoration(parameter):
     """
     根据参数创建环境装饰器函数
@@ -35,6 +42,11 @@ def create_env_decoration(parameter):
         delay_type_changing_period = getattr(parameter, 'delay_type_changing_period', 10000)
         # 每个episode是否随机延迟参数
         random_delay_per_episode = getattr(parameter, 'random_delay_per_episode', True)
+        delay_process = getattr(parameter, 'delay_process', 'legacy')
+        delay_task_strategy = getattr(parameter, 'delay_task_strategy', 'random')
+
+        if delay_task_strategy == 'acda_cycle' and delay_process == 'legacy':
+            raise ValueError('acda_cycle requires a concrete delay_process')
 
         def delay_decoration(env, log_scale_limit=3.0, rand_params=None):
             """
@@ -46,12 +58,18 @@ def create_env_decoration(parameter):
                 env,
                 initial_delay_type=initial_delay_type,
                 max_delay_range=(max_delay_range_min, max_delay_range_max),
-                random_delay_per_episode=random_delay_per_episode
+                random_delay_per_episode=random_delay_per_episode,
+                delay_process=delay_process,
             )
 
             # 如果需要非平稳延迟，采样延迟任务并设置
             # 注意：这里只是初始化，实际的任务设置会在Agent中进行
-            if nonstationary_delay:
+            if delay_task_strategy == 'acda_cycle':
+                env._delay_tasks = [dict(task) for task in ACDA_TASKS]
+                env._delay_task_strategy = delay_task_strategy
+            elif delay_process != 'legacy':
+                env._delay_tasks = env.sample_delay_tasks(delay_task_num)
+            elif nonstationary_delay:
                 delay_tasks = env.sample_delay_tasks(delay_task_num)
                 # 保存delay_tasks供后续使用
                 env._delay_tasks = delay_tasks

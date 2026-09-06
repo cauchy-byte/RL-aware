@@ -22,13 +22,16 @@ from parameter.private_config import ENV_DEFAULT_CHANGE
 class EnvWorker:
     def __init__(self, parameter: Parameter, env_name='Hopper-v2', seed=0, policy_type=Policy,
                  history_len=0, env_decoration=None, env_tasks=None,
-                 use_true_parameter=False, non_stationary=False):
+                 use_true_parameter=False, non_stationary=False, worker_index=0):
         self.env = gym.make(env_name)
         self.action_space = self.env.action_space
         self.fix_env_setting = False
         self.set_global_seed(seed)
         self.use_true_parameter = use_true_parameter
         self.non_stationary = non_stationary
+        self.worker_index = worker_index
+        self.delay_episode_index = 0
+        self.delay_task_strategy = getattr(parameter, 'delay_task_strategy', 'random')
         if env_decoration is not None:
             default_change_range = ENV_DEFAULT_CHANGE if not hasattr(parameter, 'env_default_change_range') \
                 else parameter.env_default_change_range
@@ -36,6 +39,8 @@ class EnvWorker:
                 print('[WARN]: env_default_change_range does not appears in parameter!')
             self.env = env_decoration(self.env, log_scale_limit=default_change_range,
                                     rand_params=parameter.varying_params)
+            if hasattr(self.env, 'seed') and callable(self.env.seed):
+                self.env.seed(seed)
         self.observation_space = self.env.observation_space
 
         # 从参数中获取action_history_length（动作历史长度H）
@@ -107,9 +112,19 @@ class EnvWorker:
             # 延迟环境的处理逻辑
             delay_tasks = getattr(self.env, '_delay_tasks', [])
             if delay_tasks and len(delay_tasks) > 0:
-                self.task_ind = random.randint(0, len(delay_tasks) - 1) if set_env_ind is None or set_env_ind >= \
-                                                                              len(delay_tasks) else set_env_ind
-                self.env.set_delay_task(delay_tasks[self.task_ind])
+                if (getattr(self, 'delay_task_strategy', 'random') == 'acda_cycle'
+                        and set_env_ind is None):
+                    self.task_ind = (getattr(self, 'worker_index', 0)
+                                     + getattr(self, 'delay_episode_index', 0)) % len(delay_tasks)
+                    self.delay_episode_index = getattr(self, 'delay_episode_index', 0) + 1
+                else:
+                    self.task_ind = random.randint(0, len(delay_tasks) - 1) if set_env_ind is None or set_env_ind >= \
+                                                                                  len(delay_tasks) else set_env_ind
+                delay_task = delay_tasks[self.task_ind]
+                self.env.set_delay_task(delay_task)
+
+                if 'delay_process' in delay_task:
+                    return
                 
                 if self.non_stationary:
                     # 设置延迟非平稳参数
@@ -288,11 +303,13 @@ class EnvRemoteArray:
         if use_remote:
             self.workers = [RemoteEnvWorker.remote(parameter, env_name, random.randint(0, 10000),
                                                    policy_type, history_len, env_decoration, env_tasks,
-                                                   use_true_parameter, non_stationary) for _ in range(worker_num)]
+                                                   use_true_parameter, non_stationary, worker_index)
+                            for worker_index in range(worker_num)]
         else:
             self.workers = [RemoteEnvWorker(parameter, env_name, random.randint(0, 10000),
                                             policy_type, history_len, env_decoration, env_tasks,
-                                            use_true_parameter, non_stationary) for _ in range(worker_num)]
+                                            use_true_parameter, non_stationary, worker_index)
+                            for worker_index in range(worker_num)]
 
         if env_decoration is not None:
             default_change_range = ENV_DEFAULT_CHANGE if not hasattr(parameter, 'env_default_change_range') \
@@ -591,6 +608,3 @@ if __name__ == '__main__':
         logger.log_tabular('ReplayBufferSize', len(replay_buffer))
         logger.dump_tabular()
         # print(logs)
-
-
-

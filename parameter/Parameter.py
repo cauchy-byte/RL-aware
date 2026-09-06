@@ -118,6 +118,11 @@ class Parameter:
                             help='number of threads for agent (default: 1)')
         self.register_param('num_threads')
 
+        self.training_worker_num = 1
+        parser.add_argument('--training_worker_num', type=int, default=self.training_worker_num, metavar='N',
+                            help='number of workers used only for training collection')
+        self.register_param('training_worker_num')
+
         self.seed = 1
         parser.add_argument('--seed', type=int, default=self.seed, metavar='N',
                             help='random seed (default: 1)')
@@ -438,6 +443,18 @@ class Parameter:
                             help="use delayed environment or not")
         self.register_param('use_delay')
 
+        self.delay_process = 'legacy'
+        parser.add_argument('--delay_process', type=str, default=self.delay_process,
+                            choices=['legacy', 'ge1_23', 'ge4_32', 'mm1'],
+                            help="stateful observation-delay process")
+        self.register_param('delay_process')
+
+        self.delay_task_strategy = 'random'
+        parser.add_argument('--delay_task_strategy', type=str, default=self.delay_task_strategy,
+                            choices=['random', 'acda_cycle'],
+                            help='episode-level delay task scheduling strategy')
+        self.register_param('delay_task_strategy')
+
         self.initial_delay_type = 'gamma'
         parser.add_argument('--initial_delay_type', type=str, default=self.initial_delay_type,
                             choices=['gamma', 'uniform', 'doublegaussian'],
@@ -701,4 +718,3 @@ if __name__ == '__main__':
     parameter = Parameter()
     parameter.get_commit_id()
     print(parameter)
-

@@ -257,6 +257,16 @@ class RMDMLoss:
         self.current_env_mean = None
         self.history_env_mean = None
 
+    @staticmethod
+    def _empty_loss_result(need_all_repre, need_parameter_loss):
+        """Return the same tuple shape as a non-empty RMDM calculation."""
+        result = [None, None, None, 0]
+        if need_parameter_loss:
+            result.extend([None, None])
+        if need_all_repre:
+            result.extend([[], []])
+        return tuple(result)
+
     def construct_loss(self, consistency_loss, diverse_loss, consis_w, diverse_w, std):
         consis_w_loss = None
         divers_w_loss = None
@@ -284,7 +294,7 @@ class RMDMLoss:
         all_tasks = torch.unique(tasks).detach().cpu().numpy().tolist()
         if len(all_tasks) <= 1:
             print(f'current task num: {len(all_tasks)}, {all_tasks}')
-            return None, None, None, 0
+            return self._empty_loss_result(need_all_repre, need_parameter_loss)
         total_trasition_num = valid.sum()
         all_predicted_env_vectors = []
         all_valids = []
@@ -306,7 +316,7 @@ class RMDMLoss:
             real_all_tasks.append(item)
         if len(all_tasks) <= 1:
             print(f'current task num: {len(all_tasks)}, {all_tasks}')
-            return None, None, None, 0
+            return self._empty_loss_result(need_all_repre, need_parameter_loss)
         # print(f'task num: {len(all_tasks)}, env_vector: {predicted_env_vector.shape}')
         all_tasks = real_all_tasks
         self.lst_tasks = copy.deepcopy(real_all_tasks)
@@ -391,7 +401,7 @@ class RMDMLoss:
         #     return time_last, time_count
         if len(task_ind_map) <= 1:
             print(f'current task num: {len(task_ind_map)}, {task_ind_map}')
-            return None, None, None, 0
+            return self._empty_loss_result(need_all_repre, need_parameter_loss)
         total_trasition_num = predicted_env_vector.shape[0]
         all_valids, mean_vector, valid_num_list, all_predicted_env_vectors = [], [], [], []
         real_all_tasks = sorted(list(task_ind_map.keys()))
@@ -466,7 +476,6 @@ class RMDMLoss:
         if need_all_repre:
             return rmdm_loss_it, consistency_loss, dpp_loss, len(all_tasks), all_predicted_env_vectors, all_valids
         return rmdm_loss_it, consistency_loss, dpp_loss, len(all_tasks)
-
 
 
 

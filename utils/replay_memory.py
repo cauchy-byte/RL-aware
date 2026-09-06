@@ -579,6 +579,7 @@ class MemoryNp(object):
 class MemoryArray(object):
     def __init__(self, rnn_slice_length=32, max_trajectory_num=1000, max_traj_step=1050, fix_length=0):
         self.memory = []
+        self.parallel_memories = []
         self.trajectory_length = [0] * max_trajectory_num
         self.available_traj_num = 0
         self.memory_buffer = None
@@ -588,6 +589,7 @@ class MemoryArray(object):
         self.max_traj_step = max_traj_step
         self.fix_length = fix_length
         self.transition_buffer = []
+        self.task_transition_buffers = {}
         self.transition_count = 0
         self.rnn_slice_length = rnn_slice_length
         self._last_saving_time = 0
@@ -616,6 +618,37 @@ class MemoryArray(object):
 
         res = self.array_to_transition(self.last_sampled_batch)
         return res
+
+    @staticmethod
+    def _balanced_counts(batch_size, task_ids):
+        base, remainder = divmod(batch_size, len(task_ids))
+        return [base + (1 if ind < remainder else 0)
+                for ind in range(len(task_ids))]
+
+    def _sample_task_balanced_endpoints(self, batch_size, task_ids):
+        task_ids = tuple(task_ids)
+        counts = self._balanced_counts(batch_size, task_ids)
+        selected = []
+        for task_id, count in zip(task_ids, counts):
+            candidates = self.task_transition_buffers.get(int(task_id), [])
+            if len(candidates) < count:
+                return None
+            selected.extend(candidates[ind] for ind in np.random.choice(
+                len(candidates), size=count, replace=False
+            ))
+        np.random.shuffle(selected)
+        return selected
+
+    def sample_fix_length_sub_trajs_task_balanced(self, batch_size, fix_length,
+                                                   task_ids=(1, 2, 3)):
+        endpoints = self._sample_task_balanced_endpoints(batch_size, task_ids)
+        if endpoints is None:
+            return None
+        trajs = np.array([
+            self.memory_buffer[traj_ind, point_ind + 1 - fix_length:point_ind + 1]
+            for traj_ind, point_ind in endpoints
+        ], copy=True)
+        return self.array_to_transition(trajs)
 
     def sample_trajs(self, batch_size, max_sample_size=None):
         mean_traj_len = self.transition_count / self.available_traj_num
@@ -681,9 +714,18 @@ class MemoryArray(object):
             for name, ind_range in zip(tuplenames, self.ind_range):
                 print(f'name: {name}, ind: {ind_range}')
             self.memory_buffer = np.zeros((self.max_trajectory_num, self.max_traj_step + self.fix_length, end_dim))
+        for task_id in list(self.task_transition_buffers):
+            self.task_transition_buffers[task_id] = [
+                endpoint for endpoint in self.task_transition_buffers[task_id]
+                if endpoint[0] != self.ptr
+            ]
         for ind, transition in enumerate(memory):
             self.memory_buffer[self.ptr, ind + self.fix_length, :] = self.transition_to_array(transition)
-            self.transition_buffer.append((self.ptr, ind + self.fix_length))
+            endpoint = (self.ptr, ind + self.fix_length)
+            self.transition_buffer.append(endpoint)
+            if transition.task is not None:
+                task_id = int(np.asarray(transition.task).reshape(-1)[0])
+                self.task_transition_buffers.setdefault(task_id, []).append(endpoint)
         self.transition_count -= self.trajectory_length[self.ptr]
         if self.trajectory_length[self.ptr] > 0:
             self.transition_buffer[:self.trajectory_length[self.ptr]] = []
@@ -697,19 +739,37 @@ class MemoryArray(object):
 
     def remake_transition_buffer(self):
         self.transition_buffer = []
+        self.task_transition_buffers = {}
         for ind, item in enumerate(self.trajectory_length):
             for i in range(item):
-                self.transition_buffer.append((ind, i + self.fix_length))
+                endpoint = (ind, i + self.fix_length)
+                self.transition_buffer.append(endpoint)
+                if self.memory_buffer is not None and self.ind_range is not None:
+                    task_range = self.ind_range[tuplenames.index('task')]
+                    if task_range:
+                        task_id = int(self.memory_buffer[ind, endpoint[1], task_range[0]])
+                        self.task_transition_buffers.setdefault(task_id, []).append(endpoint)
 
-    def mem_push_array(self, mem):
-        for item in mem.memory:
-            self.memory += [item]
+    def mem_push_array(self, mem, parallel_worker_num=1):
+        if parallel_worker_num <= 1:
+            for item in mem.memory:
+                self.memory += [item]
+                if item.done[0]:
+                    self.complete_traj(self.memory)
+                    self.memory = []
+            return
+
+        while len(self.parallel_memories) < parallel_worker_num:
+            self.parallel_memories.append([])
+        for worker_index, item in enumerate(mem.memory):
+            worker_slot = worker_index % parallel_worker_num
+            self.parallel_memories[worker_slot].append(item)
             if item.done[0]:
-                self.complete_traj(self.memory)
-                self.memory = []
+                self.complete_traj(self.parallel_memories[worker_slot])
+                self.parallel_memories[worker_slot] = []
 
-    def mem_push(self, mem):
-        self.mem_push_array(mem)
+    def mem_push(self, mem, parallel_worker_num=1):
+        self.mem_push_array(mem, parallel_worker_num=parallel_worker_num)
 
     def __len__(self):
         return self.available_traj_num
@@ -730,6 +790,9 @@ class MemoryArray(object):
         for k, v in data.__dict__.items():
             if not k.startswith('_') and not k == 'uniform_sample' and not k == 'rnn_slice_length':
                 setattr(self, k, v)
+        if not hasattr(self, 'parallel_memories'):
+            self.parallel_memories = []
+        self.remake_transition_buffer()
 
     def test_speed(self, fix_length=32):
         self.remake_transition_buffer()
@@ -753,6 +816,16 @@ class MemoryArray(object):
         trajs = np.array(trajs, copy=True)
         res = self.array_to_transition(trajs)
         return res
+
+    def sample_transitions_task_balanced(self, batch_size, task_ids=(1, 2, 3)):
+        endpoints = self._sample_task_balanced_endpoints(batch_size, task_ids)
+        if endpoints is None:
+            return None
+        trajs = np.array([
+            self.memory_buffer[traj_ind, point_ind]
+            for traj_ind, point_ind in endpoints
+        ], copy=True)
+        return self.array_to_transition(trajs)
 
     def stack_zeros(self, rnn_fix_length):
         self.fix_length = rnn_fix_length
